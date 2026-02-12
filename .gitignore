@@ -1,0 +1,4 @@
+.pc[cod]
+__pycache__/
+
+weights/

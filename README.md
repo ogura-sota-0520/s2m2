@@ -216,6 +216,16 @@ trtexec --onnx={onnx_file_path} --saveEngine=./{trt_file_path} --fp16 --precisio
 ```
 Supported TensorRT precisions: fp32, tf32, fp16
 
+俺の環境で.pth->.engineにする方法は
+```bash
+# 一旦.onnx形式に変換する
+python demo/export_onnx.py --model_type $MODEL_TYPE --img_width $IMG_WIDHT --img_height $IMG_HEIGHT
+
+# それをもとに.engineファイルに変換
+cd weights/onnx_save/
+uv run python ../../demo/export_tensorrt_without_trtexec.py --model_type $MODEL_TYPE --img_width $IMG_WIDHT --img_height $IMG_HEIGHT --precision $PRECISION
+```
+
 ## 📜 Citation
 
 If you find our work useful for your research, please consider citing our paper:
