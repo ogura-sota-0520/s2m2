@@ -7,9 +7,9 @@ import numpy as np
 import cv2
 import torch
 import torch._dynamo
-from s2m2.core.utils.model_utils import load_model, run_stereo_matching
-from s2m2.core.utils.image_utils import read_images
-from s2m2.core.utils.vis_utils import visualize_stereo_results_2d
+from src.models.s2m2.src.s2m2.core.utils.model_utils import load_model, run_stereo_matching
+from src.models.s2m2.src.s2m2.core.utils.image_utils import read_images
+from src.models.s2m2.src.s2m2.core.utils.vis_utils import visualize_stereo_results_2d
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

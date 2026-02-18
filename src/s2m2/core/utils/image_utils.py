@@ -2,7 +2,6 @@
 import cv2
 import torch
 import torch.nn.functional as F
-import numpy as np
 import math
 
 def read_images(left_img_path, right_img_path):

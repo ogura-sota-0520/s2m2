@@ -7,10 +7,10 @@ import numpy as np
 import cv2
 import torch
 import torch._dynamo
-from s2m2.core.utils.model_utils import load_model
-from s2m2.core.utils.image_utils import read_images
-from s2m2.core.utils.vis_utils import visualize_stereo_results_2d
-from s2m2.tools.export_model import export_onnx
+from src.models.s2m2.src.s2m2.core.utils.model_utils import load_model
+from src.models.s2m2.src.s2m2.core.utils.image_utils import read_images
+from src.models.s2m2.src.s2m2.core.utils.vis_utils import visualize_stereo_results_2d
+from src.models.s2m2.src.s2m2.tools.export_model import export_onnx
 import onnxruntime
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
