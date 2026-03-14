@@ -11,9 +11,9 @@ import numpy as np
 import torch
 
 from src.logger.logger import get_logger
-from src.utils.geometry import Size
 from src.models.s2m2.src.s2m2.core.model.s2m2 import S2M2
 from src.models.s2m2.src.s2m2.core.utils.image_utils import image_crop, image_pad
+from src.utils.geometry import Size
 
 if TYPE_CHECKING:
 	from src.config_loader.s2m2_config import S2M2Config
@@ -23,21 +23,7 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class S2M2Result:
-	"""S2M2（Stereo Matching）推論結果。
-
-	- disparity: 左画像視点の視差マップ（ピクセル単位）[H, W]
-	  - 右画像の対応点は (x - disparity[y, x], y) 側に現れる想定
-	- occlusion: オクルージョン（非対応/隠れ）推定マップ [H, W]
-	  - 元実装の説明では 0 が「オクルード」側
-	  - 点群の作成に便利
-	- confidence: 信頼度マップ [H, W]
-	  - 元実装の説明では「視差誤差が 4px 未満なら 1」相当のスコア
-	  - 点群の作成に便利
-	- avg_confidence: confidence の平均（中心領域で平均化）
-	- runtime_ms: 推論時間（ms）。warmup は含めない
-	- orig_shape: 入力画像の元サイズ
-	- used_shape: モデル入力に使ったサイズ（32の倍数にcropした後など）
-	"""
+	"""S2M2（Stereo Matching）推論結果。"""
 	disparity: np.ndarray
 	occlusion: np.ndarray
 	confidence: np.ndarray
@@ -47,36 +33,48 @@ class S2M2Result:
 	used_shape: Size
 
 
-# ===========================================================================
-# 抽象基底クラス（Strategyインターフェース）
-# ===========================================================================
-
-class S2M2Backend(ABC):
-	"""ステレオマッチングバックエンドの共通インターフェース。
-
-	バックエンド（PyTorch / TensorRT）によらず同一のインターフェースを提供する。
-	前処理・後処理のロジックはここに集約する。
-	"""
-
-	# ------------------------------------------------------------------
-	# 抽象メソッド：各バックエンドで実装する
-	# ------------------------------------------------------------------
+class S2M2Wrapper(ABC):
+	"""S2M2推論の共通インターフェース。"""
 
 	@abstractmethod
+	def _predict_processed(
+		self,
+		left_torch: torch.Tensor,
+		right_torch: torch.Tensor,
+		*,
+		n_repeat: int,
+	) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+		"""前処理済みテンソルから推論し、整形済み結果を返す。"""
+		...
+
 	def predict(
 		self,
 		left: np.ndarray,
 		right: np.ndarray,
 		*,
 		n_repeat: int = 1,
-		crop_to_multiple_of_32: bool = True,
+		crop_to_multiple_of_32: bool = False,
 	) -> S2M2Result:
 		"""左右画像から視差・オクルージョン・信頼度を推論する。"""
-		...
-
-	# ------------------------------------------------------------------
-	# 共通ユーティリティ
-	# ------------------------------------------------------------------
+		left_torch, right_torch, orig_h, orig_w, used_h, used_w = self._preprocess(
+			left, right, device=self.device, crop_to_multiple_of_32=crop_to_multiple_of_32
+		)
+		pred_disp, pred_occ, pred_conf, avg_conf, runtime_ms = self._predict_processed(
+			left_torch,
+			right_torch,
+			n_repeat=self._normalize_repeat(n_repeat),
+		)
+		return self._build_result(
+			pred_disp,
+			pred_occ,
+			pred_conf,
+			avg_conf,
+			runtime_ms,
+			orig_h=orig_h,
+			orig_w=orig_w,
+			used_h=used_h,
+			used_w=used_w,
+		)
 
 	@staticmethod
 	def _resolve_device(device: str | None) -> torch.device:
@@ -93,12 +91,7 @@ class S2M2Backend(ABC):
 		device: torch.device,
 		crop_to_multiple_of_32: bool,
 	) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int]:
-		"""入力チェック・サイズ調整・Tensor変換を行う共通前処理。
-
-		Returns:
-			left_torch, right_torch, orig_h, orig_w, used_h, used_w
-		"""
-		# 入力チェック
+		"""入力チェック・サイズ調整・Tensor変換を行う共通前処理。"""
 		if left is None or right is None:
 			raise ValueError("left/right is None")
 		if left.shape[:2] != right.shape[:2]:
@@ -107,11 +100,6 @@ class S2M2Backend(ABC):
 			raise ValueError("left/right must be HxWxC images")
 
 		orig_h, orig_w = left.shape[:2]
-
-		# -------------------------------
-		# サイズ調整（任意）
-		# - demo実装に合わせて 32 の倍数にcropする（パディング前提のため）
-		# -------------------------------
 		if crop_to_multiple_of_32:
 			used_h = (orig_h // 32) * 32
 			used_w = (orig_w // 32) * 32
@@ -122,7 +110,6 @@ class S2M2Backend(ABC):
 		else:
 			used_h, used_w = orig_h, orig_w
 
-		# Torch Tensor化（BCHW）
 		left_torch = torch.from_numpy(left).permute(-1, 0, 1).unsqueeze(0).to(device)
 		right_torch = torch.from_numpy(right).permute(-1, 0, 1).unsqueeze(0).to(device)
 
@@ -154,16 +141,36 @@ class S2M2Backend(ABC):
 
 		return disp_np, occ_np, conf_np, avg_conf_score, float(runtime_ms)
 
+	@staticmethod
+	def _normalize_repeat(n_repeat: int) -> int:
+		return max(1, int(n_repeat))
 
-# ===========================================================================
-# PyTorchバックエンド
-# ===========================================================================
+	@staticmethod
+	def _build_result(
+		disparity: np.ndarray,
+		occlusion: np.ndarray,
+		confidence: np.ndarray,
+		avg_confidence: float,
+		runtime_ms: float,
+		*,
+		orig_h: int,
+		orig_w: int,
+		used_h: int,
+		used_w: int,
+	) -> S2M2Result:
+		return S2M2Result(
+			disparity=disparity,
+			occlusion=occlusion,
+			confidence=confidence,
+			avg_confidence=avg_confidence,
+			runtime_ms=runtime_ms,
+			orig_shape=Size(width=float(orig_w), height=float(orig_h)),
+			used_shape=Size(width=float(used_w), height=float(used_h)),
+		)
 
-class S2M2PyTorchBackend(S2M2Backend):
-	"""PyTorch（.pth）モデルを使ったステレオマッチングバックエンド。
 
-	PyTorch固有のオプション（amp, torch_compile など）はここでのみ保持する。
-	"""
+class S2M2PyTorchWrapper(S2M2Wrapper):
+	"""PyTorch（.pth）モデルを使った S2M2 推論実装。"""
 
 	def __init__(
 		self,
@@ -187,46 +194,14 @@ class S2M2PyTorchBackend(S2M2Backend):
 		self.model = self._load_model(S2M2)
 		self._log_init()
 
-	# ------------------------------------------------------------------
-	# 推論
-	# ------------------------------------------------------------------
-
-	def predict(
-		self,
-		left: np.ndarray,
-		right: np.ndarray,
-		*,
-		n_repeat: int = 1,
-		crop_to_multiple_of_32: bool = False,
-	) -> S2M2Result:
-		"""左右画像から視差・オクルージョン・信頼度を推論する。"""
-		left_torch, right_torch, orig_h, orig_w, used_h, used_w = self._preprocess(
-			left, right, device=self.device, crop_to_multiple_of_32=crop_to_multiple_of_32
-		)
-
-		pred_disp, pred_occ, pred_conf, avg_conf, runtime_ms = self._run_inference(
-			left_torch, right_torch, n_repeat=max(1, int(n_repeat))
-		)
-
-		return S2M2Result(
-			disparity=pred_disp,
-			occlusion=pred_occ,
-			confidence=pred_conf,
-			avg_confidence=avg_conf,
-			runtime_ms=runtime_ms,
-			orig_shape=Size(width=float(orig_w), height=float(orig_h)),
-			used_shape=Size(width=float(used_w), height=float(used_h)),
-		)
-
 	@torch.no_grad()
-	def _run_inference(
+	def _predict_processed(
 		self,
 		left_torch: torch.Tensor,
 		right_torch: torch.Tensor,
 		*,
 		n_repeat: int,
 	) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-		"""前処理（pad）→推論→後処理（crop）をまとめて実行する。"""
 		img_height, img_width = left_torch.shape[-2:]
 		left_pad = image_pad(left_torch, 32).to(self.device)
 		right_pad = image_pad(right_torch, 32).to(self.device)
@@ -251,10 +226,6 @@ class S2M2PyTorchBackend(S2M2Backend):
 				runtime_ms = ((end_time - start_time) * 1000.0) / n_repeat
 
 		return self._post_process(pred_disp_t, pred_occ_t, pred_conf_t, img_height, img_width, runtime_ms)
-
-	# ------------------------------------------------------------------
-	# 初期化ヘルパー
-	# ------------------------------------------------------------------
 
 	def _parse_model_config(self) -> tuple[int, int]:
 		""".pthファイル名からCHxxxNTRxを抽出する。"""
@@ -306,11 +277,10 @@ class S2M2PyTorchBackend(S2M2Backend):
 			return torch.load(ckpt_path)
 
 	def _log_init(self) -> None:
-		"""初期化時の状態をログ出力する。"""
 		cuda_available = torch.cuda.is_available()
 		cuda_device_count = torch.cuda.device_count() if cuda_available else 0
 		logger.info(
-			"S2M2PyTorchBackend init: model_path=%s device=%s use_positivity=%s "
+			"S2M2PyTorchWrapper init: model_path=%s device=%s use_positivity=%s "
 			"refine_iter=%s amp=%s torch_compile=%s",
 			self.model_path,
 			self.device,
@@ -320,22 +290,14 @@ class S2M2PyTorchBackend(S2M2Backend):
 			self.torch_compile,
 		)
 		logger.info(
-			"S2M2PyTorchBackend device status: cuda_available=%s device_count=%s",
+			"S2M2PyTorchWrapper device status: cuda_available=%s device_count=%s",
 			cuda_available,
 			cuda_device_count,
 		)
 
 
-# ===========================================================================
-# TensorRTバックエンド
-# ===========================================================================
-
-class S2M2TensorRTBackend(S2M2Backend):
-	"""TensorRT（.engine）エンジンを使ったステレオマッチングバックエンド。
-
-	TensorRT固有のセットアップ（エンジンロード・バインディング）はここでのみ管理する。
-	PyTorch固有の amp / torch_compile などは一切保持しない。
-	"""
+class S2M2TensorRTWrapper(S2M2Wrapper):
+	"""TensorRT（.engine）エンジンを使った S2M2 推論実装。"""
 
 	def __init__(
 		self,
@@ -357,42 +319,22 @@ class S2M2TensorRTBackend(S2M2Backend):
 		self._load_trt_engine(self.model_path)
 		self._log_init()
 
-	# ------------------------------------------------------------------
-	# 推論
-	# ------------------------------------------------------------------
-
-	def predict(
+	def _predict_processed(
 		self,
-		left: np.ndarray,
-		right: np.ndarray,
+		left_torch: torch.Tensor,
+		right_torch: torch.Tensor,
 		*,
-		n_repeat: int = 1,
-		crop_to_multiple_of_32: bool = False,
-	) -> S2M2Result:
-		"""左右画像から視差・オクルージョン・信頼度を推論する。"""
-		left_torch, right_torch, orig_h, orig_w, used_h, used_w = self._preprocess(
-			left, right, device=self.device, crop_to_multiple_of_32=crop_to_multiple_of_32
-		)
-
+		n_repeat: int,
+	) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
 		img_height, img_width = left_torch.shape[-2:]
 		left_pad = image_pad(left_torch, 32).to(self.device)
 		right_pad = image_pad(right_torch, 32).to(self.device)
 
 		pred_disp_t, pred_occ_t, pred_conf_t, runtime_ms = self._run_trt_inference(
-			left_pad, right_pad, n_repeat=max(1, int(n_repeat))
+			left_pad, right_pad, n_repeat=n_repeat
 		)
-		pred_disp, pred_occ, pred_conf, avg_conf, runtime_ms = self._post_process(
+		return self._post_process(
 			pred_disp_t, pred_occ_t, pred_conf_t, img_height, img_width, runtime_ms
-		)
-
-		return S2M2Result(
-			disparity=pred_disp,
-			occlusion=pred_occ,
-			confidence=pred_conf,
-			avg_confidence=avg_conf,
-			runtime_ms=runtime_ms,
-			orig_shape=Size(width=float(orig_w), height=float(orig_h)),
-			used_shape=Size(width=float(used_w), height=float(used_h)),
 		)
 
 	def _run_trt_inference(
@@ -402,7 +344,6 @@ class S2M2TensorRTBackend(S2M2Backend):
 		*,
 		n_repeat: int,
 	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-		"""TensorRTで推論し、出力テンソルと実行時間を返す。"""
 		if self.trt_engine is None or self.trt_context is None:
 			raise RuntimeError("TensorRT engine is not initialized")
 		if self.device.type != "cuda":
@@ -416,7 +357,6 @@ class S2M2TensorRTBackend(S2M2Backend):
 		left_binding = self.trt_bindings[left_name]
 		right_binding = self.trt_bindings[right_name]
 
-		# 入力サイズ検証
 		for pad, binding in ((left_pad, left_binding), (right_pad, right_binding)):
 			expected = binding["shape"]
 			if len(expected) >= 4:
@@ -479,12 +419,7 @@ class S2M2TensorRTBackend(S2M2Backend):
 			runtime_ms,
 		)
 
-	# ------------------------------------------------------------------
-	# 初期化ヘルパー
-	# ------------------------------------------------------------------
-
 	def _load_trt_engine(self, engine_path: Path) -> None:
-		"""TensorRTエンジンをロードして実行コンテキストを準備する。"""
 		if not engine_path.exists():
 			raise FileNotFoundError(f"Engine file not found: {engine_path}")
 		if self.device.type != "cuda":
@@ -507,7 +442,6 @@ class S2M2TensorRTBackend(S2M2Backend):
 		self._prepare_trt_bindings(trt)
 
 	def _prepare_trt_bindings(self, trt) -> None:
-		"""TensorRTの入出力バインディング情報を解析して保持する。"""
 		if self.trt_engine is None:
 			raise RuntimeError("TensorRT engine is not initialized")
 
@@ -558,67 +492,36 @@ class S2M2TensorRTBackend(S2M2Backend):
 		self.trt_output_names = outputs
 
 	def _log_init(self) -> None:
-		"""初期化時の状態をログ出力する。"""
 		logger.info(
-			"S2M2TensorRTBackend init: model_path=%s device=%s",
+			"S2M2TensorRTWrapper init: model_path=%s device=%s",
 			self.model_path,
 			self.device,
 		)
 
 
-# ===========================================================================
-# Factoryクラス
-# ===========================================================================
-class S2M2Wrapper:
-	"""明示的なバックエンド生成を行うファクトリクラス。"""
+def create_s2m2_wrapper(config: "S2M2Config") -> S2M2Wrapper:
+	"""S2M2Config から適切な推論実装を生成する。"""
+	path = Path(config.model_path)
+	suffix = path.suffix.lower()
 
-	@staticmethod
-	def from_pytorch(
-		model_path: str | Path,
-		device: str = "cuda",
-		use_positivity: bool = False,
-		refine_iter: int = 3,
-		amp: bool = True,
-		torch_compile: bool = False,
-		verbose: bool = False,
-	) -> S2M2PyTorchBackend:
-		"""PyTorchバックエンドを明示的な引数で生成する。"""
-		return S2M2PyTorchBackend(
-			model_path=Path(model_path),
-			device=device,
-			use_positivity=use_positivity,
-			refine_iter=refine_iter,
-			amp=amp,
-			torch_compile=torch_compile,
-			verbose=verbose,
+	if suffix == ".pth":
+		return S2M2PyTorchWrapper(
+			model_path=path,
+			device=config.device,
+			use_positivity=config.use_positivity,
+			refine_iter=config.refine_iter,
+			amp=config.amp,
+			torch_compile=config.torch_compile,
+			verbose=config.verbose,
+		)
+	if suffix == ".engine":
+		return S2M2TensorRTWrapper(
+			model_path=path,
+			device=config.device,
+			verbose=config.verbose,
 		)
 
-	@staticmethod
-	def from_tensorrt(
-		model_path: str | Path,
-		device: str = "cuda",
-		verbose: bool = False,
-	) -> S2M2TensorRTBackend:
-		"""TensorRTバックエンドを最小限の引数で生成する。"""
-		return S2M2TensorRTBackend(
-			model_path=Path(model_path),
-			device=device,
-			verbose=verbose,
-		)
-
-	@staticmethod
-	def from_config(config: "S2M2Config") -> S2M2Backend:
-		"""（おまけ）既存のConfigオブジェクトからも生成できるように残しておく"""
-		path = Path(config.model_path)
-		if path.suffix.lower() == ".pth":
-			return S2M2Wrapper.from_pytorch(
-				model_path=path,
-				device=config.device,
-				use_positivity=config.use_positivity,
-				refine_iter=config.refine_iter,
-				amp=config.amp,
-				torch_compile=config.torch_compile,
-				verbose=config.verbose,
-			)
-		else:
-			return S2M2Wrapper.from_tensorrt(path, device=config.device, verbose=config.verbose)
+	raise ValueError(
+		f"Unsupported model format: '{suffix}'. "
+		"Supported formats: .pth (PyTorch), .engine (TensorRT)"
+	)
