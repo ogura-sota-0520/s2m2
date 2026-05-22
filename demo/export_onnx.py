@@ -39,7 +39,7 @@ def get_args_parser():
 def main(args):
     img_height, img_width = args.img_height, args.img_width
 
-    model = load_model(os.path.join(project_root, "weights/pretrain_weights"), args.model_type, not args.allow_negative, args.num_refine, 'cpu')
+    model = load_model(os.path.join(project_root, "weights/"), args.model_type, not args.allow_negative, args.num_refine, 'cpu')
 
     # load web stereo images
     if args.allow_negative:

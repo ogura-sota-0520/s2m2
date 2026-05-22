@@ -3,7 +3,7 @@ import argparse
 import tensorrt as trt
 
 # プロジェクトのルートディレクトリ設定
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = "src/models/s2m2/"
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
@@ -24,11 +24,11 @@ def build_engine(onnx_file_path, engine_file_path, precision):
     config = builder.create_builder_config()
 
     # ONNXファイルの読み込み
-    with open(onnx_file_path, 'rb') as model:
-        if not parser.parse(model.read()):
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            return None
+    onnx_file_path = os.path.abspath(onnx_file_path)
+    if not parser.parse_from_file(onnx_file_path):
+        for error in range(parser.num_errors):
+            print(parser.get_error(error))
+        return None
 
     # 精度（Precision）の設定
     if precision == 'fp16':
